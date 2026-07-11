@@ -1,8 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dateutil import parser
-import re
+from dotenv import load_dotenv
+import google.generativeai as genai
+import os
+import json
+
+load_dotenv()
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 app = FastAPI()
 
@@ -18,99 +26,76 @@ class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-def parse_amount(x):
-    if not x:
-        return None
-    x = x.replace(",", "")
-    return float(x)
-
-
 @app.post("/extract")
-def extract(req: InvoiceRequest):
+async def extract(req: InvoiceRequest):
 
-    text = req.invoice_text
+    prompt = f"""
+You are an invoice extraction engine.
 
-    invoice_no = None
-    date = None
-    vendor = None
-    amount = None
-    tax = None
-    currency = None
+Extract the invoice into EXACTLY this JSON schema.
 
-    # Invoice Number
-    patterns = [
-        r"Invoice\s*No[:\s]*([A-Za-z0-9\-\/]+)",
-        r"Invoice\s*#[:\s]*([A-Za-z0-9\-\/]+)",
-        r"Ref[:\s]*([A-Za-z0-9\-\/]+)"
-    ]
+{{
+  "invoice_no": null,
+  "date": null,
+  "vendor": null,
+  "amount": null,
+  "tax": null,
+  "currency": null
+}}
 
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            invoice_no = m.group(1).strip()
-            break
+Rules:
 
-    # Vendor
-    patterns = [
-        r"Vendor[:\s]*(.+)",
-        r"Supplier[:\s]*(.+)",
-        r"From[:\s]*(.+)"
-    ]
+1. Return ONLY JSON.
+2. No markdown.
+3. No explanation.
+4. date must be YYYY-MM-DD.
+5. amount is ALWAYS the amount BEFORE TAX.
 
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            vendor = m.group(1).strip()
-            break
+If the invoice uses ANY of these labels:
 
-    # Date
-    patterns = [
-        r"Date[:\s]*(.+)",
-        r"Issued[:\s]*(.+)"
-    ]
+Subtotal
+Sub Total
+Amount Before Tax
+Taxable Amount
+Taxable Value
+Assessable Value
+Net Amount
+Net Value
+Base Amount
+Pre Tax Amount
 
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m:
-            try:
-                date = parser.parse(m.group(1)).date().isoformat()
-                break
-            except:
-                pass
+use that value as amount.
 
-    # Amount (Subtotal)
-    m = re.search(
-        r"Subtotal.*?([0-9,]+\.[0-9]{2})",
-        text,
-        re.I
-    )
+If only Total and Tax are available then compute
 
-    if m:
-        amount = parse_amount(m.group(1))
+amount = total - tax
 
-    # Tax
-    m = re.search(
-        r"(GST|CGST|SGST|IGST).*?([0-9,]+\.[0-9]{2})",
-        text,
-        re.I
-    )
+Tax may be called:
 
-    if m:
-        tax = parse_amount(m.group(2))
+GST
+CGST
+SGST
+IGST
+VAT
+Sales Tax
 
-    # Currency
-    m = re.search(r"Currency[:\s]*([A-Z]{3})", text)
+Currency should be one of:
 
-    if m:
-        currency = m.group(1)
-    elif "Rs" in text or "₹" in text:
-        currency = "INR"
+INR
+USD
+EUR
+GBP
 
-    return {
-        "invoice_no": invoice_no,
-        "date": date,
-        "vendor": vendor,
-        "amount": amount,
-        "tax": tax,
-        "currency": currency
-    }
+Invoice text:
+
+{req.invoice_text}
+"""
+
+    response = model.generate_content(prompt)
+
+    text = response.text.strip()
+
+    if text.startswith("```"):
+        text = text.replace("```json", "").replace("```", "").strip()
+
+    return json.loads(text)
