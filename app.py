@@ -5,12 +5,13 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 import os
 import json
+import re
 
 load_dotenv()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-model = genai.GenerativeModel("gemini-2.5-flash")
+model = genai.GenerativeModel("gemini-3-flash-preview")
 
 app = FastAPI()
 
@@ -30,63 +31,31 @@ class InvoiceRequest(BaseModel):
 async def extract(req: InvoiceRequest):
 
     prompt = f"""
-You are an invoice extraction engine.
+Extract invoice information.
 
-Extract the invoice into EXACTLY this JSON schema.
+Return ONLY valid JSON.
+
+Return exactly:
 
 {{
-  "invoice_no": null,
-  "date": null,
-  "vendor": null,
-  "amount": null,
-  "tax": null,
-  "currency": null
+"invoice_no": null,
+"date": null,
+"vendor": null,
+"amount": null,
+"tax": null,
+"currency": null
 }}
 
 Rules:
 
-1. Return ONLY JSON.
-2. No markdown.
-3. No explanation.
-4. date must be YYYY-MM-DD.
-5. amount is ALWAYS the amount BEFORE TAX.
+- amount = subtotal BEFORE tax.
+- If only Total and Tax exist, compute amount = Total - Tax.
+- Convert date to YYYY-MM-DD.
+- Currency must be INR/USD/EUR/GBP.
+- No markdown.
+- No explanation.
 
-If the invoice uses ANY of these labels:
-
-Subtotal
-Sub Total
-Amount Before Tax
-Taxable Amount
-Taxable Value
-Assessable Value
-Net Amount
-Net Value
-Base Amount
-Pre Tax Amount
-
-use that value as amount.
-
-If only Total and Tax are available then compute
-
-amount = total - tax
-
-Tax may be called:
-
-GST
-CGST
-SGST
-IGST
-VAT
-Sales Tax
-
-Currency should be one of:
-
-INR
-USD
-EUR
-GBP
-
-Invoice text:
+Invoice:
 
 {req.invoice_text}
 """
@@ -95,7 +64,76 @@ Invoice text:
 
     text = response.text.strip()
 
-    if text.startswith("```"):
-        text = text.replace("```json", "").replace("```", "").strip()
+    text = text.replace("```json", "").replace("```", "").strip()
 
-    return json.loads(text)
+    data = json.loads(text)
+
+    invoice = req.invoice_text
+
+    # -----------------------------
+    # Fallback amount
+    # -----------------------------
+
+    if data.get("amount") is None:
+
+        labels = [
+            "Subtotal",
+            "Sub Total",
+            "Amount Before Tax",
+            "Taxable Amount",
+            "Taxable Value",
+            "Assessable Value",
+            "Net Amount",
+            "Net Value",
+            "Base Amount",
+            "Pre Tax Amount",
+            "Basic Amount",
+            "Invoice Amount"
+        ]
+
+        for label in labels:
+
+            m = re.search(
+                rf"{label}\s*[:\-]?\s*(?:Rs\.?|₹|USD|EUR|GBP|INR)?\s*([0-9,]+(?:\.\d+)?)",
+                invoice,
+                re.IGNORECASE,
+            )
+
+            if m:
+                data["amount"] = float(m.group(1).replace(",", ""))
+                break
+
+    # -----------------------------
+    # Fallback tax
+    # -----------------------------
+
+    if data.get("tax") is None:
+
+        m = re.search(
+            r"(GST|CGST|SGST|IGST|VAT|Sales Tax).*?([0-9,]+(?:\.\d+)?)",
+            invoice,
+            re.IGNORECASE,
+        )
+
+        if m:
+            data["tax"] = float(m.group(2).replace(",", ""))
+
+    # -----------------------------
+    # Compute amount = total - tax
+    # -----------------------------
+
+    if data.get("amount") is None and data.get("tax") is not None:
+
+        m = re.search(
+            r"(Grand Total|Invoice Total|Total)\s*[:\-]?\s*(?:Rs\.?|₹|USD|EUR|GBP|INR)?\s*([0-9,]+(?:\.\d+)?)",
+            invoice,
+            re.IGNORECASE,
+        )
+
+        if m:
+
+            total = float(m.group(2).replace(",", ""))
+
+            data["amount"] = round(total - float(data["tax"]), 2)
+
+    return data
